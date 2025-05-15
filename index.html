@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR Dialog System with Unbounded Space</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <style>
+    body { margin: 0; overflow: hidden; font-family: system-ui, sans-serif; background: #f0f2f5; }
+    #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; }
+    #start-button { padding: 15px 28px; font-size: 18px; background: #4876FF; color: white; border: none; border-radius: 12px; box-shadow: 0 4px 14px rgba(72,118,255,0.4); cursor: pointer; transition: all 0.2s; font-weight: 600; }
+    #start-button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(72,118,255,0.5); }
+    #status { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.7); color: white; padding: 12px 24px; border-radius: 12px; font-size: 16px; font-weight: 500; margin: 0; backdrop-filter: blur(8px); box-shadow: 0 4px 12px rgba(0,0,0,0.2); max-width: 80%; text-align: center; display: none; z-index: 1000; }
+    .exit-ar { position: fixed; top: 20px; right: 20px; background: rgba(0,0,0,0.5); color: white; border: none; border-radius: 50%; width: 46px; height: 46px; display: none; align-items: center; justify-content: center; font-size: 24px; cursor: pointer; backdrop-filter: blur(8px); box-shadow: 0 2px 10px rgba(0,0,0,0.3); z-index: 1000; }
+    .xr-active .exit-ar { display: flex; }
+  </style>
+</head>
+<body>
+  <div id="overlay"><button id="start-button">Start Unbounded Dialog Demo</button></div>
+  <button class="exit-ar" id="exit-ar">×</button>
+  <div id="status"></div>
+  
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+
+    // Main variables
+    let camera, scene, renderer, controllers = [], xrSession = null, raycaster, tempMatrix, dialogSystem;
+    let referenceSpace = null;
+    
+    // Initialize WebXR components
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0);
+      renderer.shadowMap.enabled = true;
+      document.body.appendChild(renderer.domElement);
+
+      // Lighting
+      scene.add(new THREE.AmbientLight(0x404040, 2));
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1.5);
+      directionalLight.position.set(1, 1, 1).normalize();
+      directionalLight.castShadow = true;
+      scene.add(directionalLight);
+      
+      // Setup for interaction
+      raycaster = new THREE.Raycaster();
+      tempMatrix = new THREE.Matrix4();
+      dialogSystem = new DialogSystem();
+      
+      // Event listeners
+      window.addEventListener('resize', onWindowResize);
+      document.getElementById('start-button').addEventListener('click', startARSession);
+      document.getElementById('exit-ar').addEventListener('click', endARSession);
+    }
+
+    // Start AR session with unbounded reference space
+    function startARSession() {
+      if (!navigator.xr) {
+        updateStatus('WebXR not supported in this browser.');
+        return;
+      }
+      
+      navigator.xr.isSessionSupported('immersive-ar')
+        .then(supported => {
+          if (supported) {
+            navigator.xr.requestSession('immersive-ar', { 
+              requiredFeatures: ['hit-test', 'unbounded'],  // Added 'unbounded' here
+              optionalFeatures: ['dom-overlay', 'hand-tracking'], 
+              domOverlay: { root: document.body } 
+            })
+            .then(onSessionStarted)
+            .catch(err => {
+              console.error('Session start error:', err);
+              // Fallback to regular AR without unbounded reference space
+              updateStatus('Unbounded space not supported. Falling back to bounded AR...');
+              navigator.xr.requestSession('immersive-ar', { 
+                requiredFeatures: ['hit-test'],
+                optionalFeatures: ['dom-overlay', 'hand-tracking'], 
+                domOverlay: { root: document.body } 
+              })
+              .then(onSessionStarted)
+              .catch(err => updateStatus('Failed to start AR: ' + err.message));
+            });
+          } else {
+            updateStatus('WebXR AR not supported on this device.');
+          }
+        });
+    }
+
+    // Handle AR session start
+    function onSessionStarted(session) {
+      xrSession = session;
+      document.getElementById('start-button').style.display = 'none';
+      document.body.classList.add('xr-active');
+      
+      // Try to get unbounded reference space first
+      renderer.xr.setSession(session);
+      session.requestReferenceSpace('unbounded')
+        .then(space => {
+          referenceSpace = space;
+          updateStatus('Unbounded reference space successfully enabled!');
+          console.log('Using unbounded reference space');
+          setupARSession();
+        })
+        .catch(err => {
+          console.warn('Unbounded reference space not available:', err);
+          // Fallback to local reference space
+          session.requestReferenceSpace('local')
+            .then(space => {
+              referenceSpace = space;
+              updateStatus('Using local reference space (bounded).');
+              console.log('Falling back to local reference space');
+              setupARSession();
+            })
+            .catch(error => {
+              console.error('Error getting reference space:', error);
+              updateStatus('Failed to get any reference space. Ending session.');
+              session.end();
+            });
+        });
+    }
+    
+    function setupARSession() {
+      // Setup controllers
+      controllers = [0, 1].map(i => {
+        const controller = renderer.xr.getController(i);
+        controller.userData.id = i;
+        controller.userData.isSelecting = false;
+        
+        // Visual indicator
+        const handMesh = new THREE.Mesh(
+          new THREE.SphereGeometry(0.02, 16, 16),
+          new THREE.MeshStandardMaterial({
+            color: i === 0 ? 0x4876FF : 0xFF4848,
+            roughness: 0.3,
+            metalness: 0.5,
+            transparent: true,
+            opacity: 0.7
+          })
+        );
+        controller.add(handMesh);
+        
+        controller.addEventListener('selectstart', onControllerSelectStart);
+        controller.addEventListener('selectend', onControllerSelectEnd);
+        scene.add(controller);
+        return controller;
+      });
+      
+      // Add distance marker to show unbounded movement
+      addDistanceMarker();
+      
+      // Initialize dialog system
+      dialogSystem.init(scene, camera);
+      setTimeout(() => dialogSystem.startDialogSequence(), 1500);
+      
+      renderer.setAnimationLoop(render);
+      xrSession.addEventListener('end', onSessionEnd);
+      updateStatus('Dialog system ready! You can move beyond guardian boundaries.');
+    }
+    
+    // Add a distance marker to show unbounded movement
+    function addDistanceMarker() {
+      // Create a ring at the origin to help visualize movement
+      const ringGeometry = new THREE.RingGeometry(0.5, 0.6, 32);
+      const ringMaterial = new THREE.MeshBasicMaterial({ 
+        color: 0x00ff00, 
+        side: THREE.DoubleSide,
+        transparent: true,
+        opacity: 0.7
+      });
+      const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+      ring.rotation.x = -Math.PI / 2; // Lay flat on the ground
+      ring.position.y = 0.01; // Slightly above ground
+      scene.add(ring);
+      
+      // Add text to show starting point
+      const canvas = document.createElement('canvas');
+      canvas.width = 256;
+      canvas.height = 128;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = 'white';
+      ctx.font = 'bold 24px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('Starting Point', canvas.width/2, canvas.height/2);
+      
+      const texture = new THREE.CanvasTexture(canvas);
+      const textMaterial = new THREE.MeshBasicMaterial({
+        map: texture,
+        transparent: true,
+        side: THREE.DoubleSide
+      });
+      
+      const textPlane = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.5, 0.25),
+        textMaterial
+      );
+      textPlane.position.set(0, 0.3, 0);
+      textPlane.lookAt(0, 1.6, 0); // Look toward typical user height
+      scene.add(textPlane);
+      
+      // Add arrows pointing outward to encourage exploration
+      const arrowDirections = [
+        new THREE.Vector3(1, 0, 0),
+        new THREE.Vector3(-1, 0, 0),
+        new THREE.Vector3(0, 0, 1),
+        new THREE.Vector3(0, 0, -1)
+      ];
+      
+      arrowDirections.forEach((direction, index) => {
+        const arrowGroup = new THREE.Group();
+        
+        // Arrow body
+        const arrowBody = new THREE.Mesh(
+          new THREE.BoxGeometry(0.05, 0.05, 0.4),
+          new THREE.MeshBasicMaterial({ color: 0x4876FF })
+        );
+        arrowBody.position.z = 0.2;
+        arrowGroup.add(arrowBody);
+        
+        // Arrow head
+        const arrowHead = new THREE.Mesh(
+          new THREE.ConeGeometry(0.08, 0.2, 8),
+          new THREE.MeshBasicMaterial({ color: 0x4876FF })
+        );
+        arrowHead.position.z = 0.5;
+        arrowHead.rotation.x = Math.PI / 2;
+        arrowGroup.add(arrowHead);
+        
+        // Position and orient the arrow
+        arrowGroup.position.set(
+          direction.x * 0.8,
+          0.1,
+          direction.z * 0.8
+        );
+        
+        // Make arrow look in the direction
+        arrowGroup.lookAt(
+          arrowGroup.position.x + direction.x,
+          arrowGroup.position.y,
+          arrowGroup.position.z + direction.z
+        );
+        
+        scene.add(arrowGroup);
+      });
+    }
+    
+    // End AR session
+    function endARSession() {
+      if (xrSession) xrSession.end();
+    }
+    
+    function onSessionEnd() {
+      document.body.classList.remove('xr-active');
+      document.getElementById('start-button').style.display = 'block';
+      document.getElementById('status').style.display = 'none';
+      controllers = [];
+      renderer.setAnimationLoop(null);
+      xrSession = null;
+      referenceSpace = null;
+      
+      // Clean up scene
+      while(scene.children.length > 0) { 
+        const object = scene.children[0];
+        if (object.geometry) object.geometry.dispose();
+        if (object.material) {
+          if (Array.isArray(object.material)) {
+            object.material.forEach(m => m.dispose());
+          } else {
+            object.material.dispose();
+          }
+        }
+        scene.remove(object); 
+      }
+    }
+    
+    function onControllerSelectStart(event) {
+      const controller = event.target;
+      controller.userData.isSelecting = true;
+      
+      // Raycasting for interaction
+      tempMatrix.identity().extractRotation(controller.matrixWorld);
+      raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+      raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+      
+      const interactiveObjects = dialogSystem.getInteractiveObjects();
+      const intersects = raycaster.intersectObjects(interactiveObjects, true);
+      
+      if (intersects.length > 0) {
+        // Find interactive parent
+        let current = intersects[0].object;
+        while (current) {
+          if (current.userData && current.userData.onClick) {
+            current.userData.onClick();
+            break;
+          }
+          current = current.parent;
+        }
+      }
+    }
+    
+    function onControllerSelectEnd(event) {
+      event.target.userData.isSelecting = false;
+    }
+    
+    // Display distance from origin in render loop
+    function render(timestamp, frame) {
+      // Update dialog system
+      if (dialogSystem) dialogSystem.update(camera);
+      
+      // Check controller interaction
+      controllers.forEach(controller => {
+        if (controller.userData.isSelecting) {
+          tempMatrix.identity().extractRotation(controller.matrixWorld);
+          raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+          raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+          
+          const interactiveObjects = dialogSystem.getInteractiveObjects();
+          const intersects = raycaster.intersectObjects(interactiveObjects, true);
+          
+          if (intersects.length > 0) {
+            // Visual feedback on hover
+            const object = intersects[0].object;
+            if (object.material && !object.userData.isHovered) {
+              object.userData.originalColor = object.material.color.clone();
+              object.material.color.multiplyScalar(1.2);
+              object.userData.isHovered = true;
+            }
+          }
+        }
+      });
+      
+      // Display distance from origin to demonstrate unbounded space
+      if (frame && camera.position) {
+        const distance = Math.sqrt(
+          camera.position.x * camera.position.x + 
+          camera.position.z * camera.position.z
+        );
+        
+        // Only update status when distance changes significantly
+        if (Math.abs(controller?.userData?.lastDistance - distance) > 0.5) {
+          if (distance > 2) {
+            controller.userData.lastDistance = distance;
+            updateStatus(`You've moved ${distance.toFixed(1)}m from the start point!`);
+          }
+        }
+      }
+      
+      renderer.render(scene, camera);
+    }
+    
+    function onWindowResize() {
+      if (camera) {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+      }
+      if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+    
+    function updateStatus(message) {
+      const statusElement = document.getElementById('status');
+      statusElement.textContent = message;
+      statusElement.style.display = 'block';
+      
+      // Auto-hide after 4 seconds for non-error messages
+      if (!message.includes('error') && !message.includes('not supported')) {
+        setTimeout(() => { statusElement.style.display = 'none'; }, 4000);
+      }
+    }
+    
+    // Dialog System Class - Improved for GIF animation and dialog appearance
+    class DialogSystem {
+      constructor() {
+        this.dialogPanel = null;
+        this.currentDialogIndex = 0;
+        this.isActive = false;
+        this.nextButton = null;
+        this.portraitMesh = null;
+        this.textElement = null;
+        this.nameElement = null;
+        this.dialogGroup = null;
+        this.videoMaterials = {};
+        
+        // Dialog content - Updated with unbounded space theme
+        this.dialogSequence = [
+          { speaker: "Hero", message: "Welcome to the unbounded space demo! You can now move beyond your Guardian boundary.", color: "#4876FF" },
+          { speaker: "Enemy", message: "Try walking in any direction. The green ring marks your starting point.", color: "#FF4848" },
+          { speaker: "Hero", message: "This experience uses the 'unbounded' reference space type, allowing for large-scale movement.", color: "#4876FF" },
+          { speaker: "Enemy", message: "Be careful of your real environment! Make sure you have a clear space to move around safely.", color: "#FF4848" },
+          { speaker: "Hero", message: "Enjoy exploring without limits! The dialog will restart when complete.", color: "#4876FF" }
+        ];
+        
+        // Preload assets
+        this.loadAssets();
+      }
+      
+      loadAssets() {
+        // Create data URLs for basic placeholder images as fallback
+        const heroPlaceholder = this.createPlaceholderImage(256, 256, '#4876FF', 'Hero');
+        const enemyPlaceholder = this.createPlaceholderImage(256, 256, '#FF4848', 'Enemy');
+        
+        // Initialize placeholder textures first
+        this.heroTexture = new THREE.TextureLoader().load(heroPlaceholder);
+        this.enemyTexture = new THREE.TextureLoader().load(enemyPlaceholder);
+        
+        // Create video elements for GIFs
+        this.setupVideoTexture('hero', 'hero.gif');
+        this.setupVideoTexture('enemy', 'deer.gif');
+      }
+      
+      // Create video texture from GIF for animation
+      setupVideoTexture(name, url) {
+        // Create video element
+        const video = document.createElement('video');
+        video.autoplay = true;
+        video.loop = true;
+        video.muted = true;
+        video.playsInline = true;
+        video.crossOrigin = 'anonymous';
+        video.src = url;
+        
+        // Create texture from video
+        const texture = new THREE.VideoTexture(video);
+        texture.minFilter = THREE.LinearFilter;
+        texture.magFilter = THREE.LinearFilter;
+        texture.format = THREE.RGBAFormat;
+        
+        // Create material
+        const material = new THREE.MeshBasicMaterial({
+          map: texture,
+          transparent: true,
+          side: THREE.DoubleSide
+        });
+        
+        // Store in videoMaterials object
+        this.videoMaterials[name] = {
+          video: video,
+          material: material
+        };
+        
+        // Force video to play (important for WebXR)
+        video.play().catch(e => console.warn('Video play error:', e));
+      }
+      
+      // Helper to create fallback images
+      createPlaceholderImage(width, height, color, text) {
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        
+        // Background
+        ctx.fillStyle = color;
+        ctx.fillRect(0, 0, width, height);
+        
+        // Border
+        ctx.strokeStyle = 'white';
+        ctx.lineWidth = 4;
+        ctx.strokeRect(4, 4, width-8, height-8);
+        
+        // Text
+        ctx.font = 'bold 36px sans-serif';
+        ctx.fillStyle = 'white';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(text, width/2, height/2);
+        
+        return canvas.toDataURL();
+      }
+      
+      init(scene, camera) {
+        this.scene = scene;
+        this.camera = camera;
+        
+        // Create dialog group
+        this.dialogGroup = new THREE.Group();
+        this.dialogGroup.position.set(0, 0, -0.6);
+        this.scene.add(this.dialogGroup);
+        
+        // Create dialog panel
+        this.createDialogPanel();
+      }
+      
+      createDialogPanel() {
+        // Main panel
+        const panel = new THREE.Group();
+        const panelWidth = 0.6;
+        const panelHeight = 0.3;
+        
+        // Create background, portrait, text and button
+        this.createPanelBackground(panel, panelWidth, panelHeight);
+        this.createPortraitAndName(panel, panelWidth, panelHeight);
+        this.createTextElement(panel, panelWidth, panelHeight);
+        this.createNextButton(panel, panelWidth, panelHeight);
+        
+        // Add to dialog group
+        this.dialogGroup.add(panel);
+        this.dialogPanel = panel;
+        this.dialogPanel.visible = false;
+      }
+      
+      createPanelBackground(panel, width, height) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 512;
+        canvas.height = 256;
+        const ctx = canvas.getContext('2d');
+        
+        // Draw rounded rectangle
+        const cornerRadius = 32;
+        ctx.fillStyle = 'rgba(10, 12, 16, 0.85)';
+        ctx.beginPath();
+        ctx.moveTo(cornerRadius, 0);
+        ctx.lineTo(canvas.width - cornerRadius, 0);
+        ctx.quadraticCurveTo(canvas.width, 0, canvas.width, cornerRadius);
+        ctx.lineTo(canvas.width, canvas.height - cornerRadius);
+        ctx.quadraticCurveTo(canvas.width, canvas.height, canvas.width - cornerRadius, canvas.height);
+        ctx.lineTo(cornerRadius, canvas.height);
+        ctx.quadraticCurveTo(0, canvas.height, 0, canvas.height - cornerRadius);
+        ctx.lineTo(0, cornerRadius);
+        ctx.quadraticCurveTo(0, 0, cornerRadius, 0);
+        ctx.closePath();
+        ctx.fill();
+        
+        // Add subtle border
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        const texture = new THREE.CanvasTexture(canvas);
+        const material = new THREE.MeshBasicMaterial({
+          map: texture,
+          transparent: true,
+          side: THREE.DoubleSide
+        });
+        
+        panel.add(new THREE.Mesh(
+          new THREE.PlaneGeometry(width, height),
+          material
+        ));
+      }
+      
+      createPortraitAndName(panel, panelWidth, panelHeight) {
+        // Portrait setup - using 16:9 aspect ratio
+        const portraitWidth = 0.15;
+        const portraitHeight = portraitWidth * (9/16); // 16:9 aspect ratio
+        
+        // Create a plane for the portrait with a fallback texture to start
+        this.portraitMesh = new THREE.Mesh(
+          new THREE.PlaneGeometry(portraitWidth, portraitHeight),
+          new THREE.MeshBasicMaterial({
+            map: this.heroTexture,
+            transparent: true,
+            side: THREE.DoubleSide
+          })
+        );
+        this.portraitMesh.position.set(-(panelWidth/2) + portraitWidth/2 + 0.025, 0.04, 0.001);
+        panel.add(this.portraitMesh);
+        
+        // Name element
+        const nameCanvas = document.createElement('canvas');
+        nameCanvas.width = 256;
+        nameCanvas.height = 64;
+        const nameCtx = nameCanvas.getContext('2d');
+        
+        // Draw initial name
+        this.drawName(nameCtx, "Hero", "#4876FF", nameCanvas.width, nameCanvas.height);
+        
+        const nameTexture = new THREE.CanvasTexture(nameCanvas);
+        this.nameElement = new THREE.Mesh(
+          new THREE.PlaneGeometry(portraitWidth, 0.04),
+          new THREE.MeshBasicMaterial({
+            map: nameTexture, 
+            transparent: true,
+            side: THREE.DoubleSide
+          })
+        );
+        this.nameElement.position.set(-(panelWidth/2) + portraitWidth/2 + 0.025, -(portraitHeight/2) - 0.01, 0.001);
+        
+        // Update function for name
+        this.nameElement.userData.updateName = (name, color) => {
+          this.drawName(nameCtx, name, color, nameCanvas.width, nameCanvas.height);
+          nameTexture.needsUpdate = true;
+        };
+        
+        panel.add(this.nameElement);
+      }
+      
+      drawName(ctx, name, color, width, height) {
+        // Clear canvas
+        ctx.clearRect(0, 0, width, height);
+        
+        // Draw rounded rectangle background
+        const cornerRadius = 12;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(cornerRadius, 0);
+        ctx.lineTo(width - cornerRadius, 0);
+        ctx.quadraticCurveTo(width, 0, width, cornerRadius);
+        ctx.lineTo(width, height - cornerRadius);
+        ctx.quadraticCurveTo(width, height, width - cornerRadius, height);
+        ctx.lineTo(cornerRadius, height);
+        ctx.quadraticCurveTo(0, height, 0, height - cornerRadius);
+        ctx.lineTo(0, cornerRadius);
+        ctx.quadraticCurveTo(0, 0, cornerRadius, 0);
+        ctx.closePath();
+        ctx.fill();
+        
+        // Add text
+        ctx.font = 'bold 32px sans-serif';
+        ctx.fillStyle = 'white';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(name, width / 2, height / 2);
+      }
+      
+      createTextElement(panel, panelWidth, panelHeight) {
+        // Create text canvas
+        const textCanvas = document.createElement('canvas');
+        textCanvas.width = 640;
+        textCanvas.height = 256;
+        const textCtx = textCanvas.getContext('2d');
+        
+        // Initial drawing
+        this.drawText(textCtx, "Dialog text will appear here...", textCanvas.width, textCanvas.height);
+        
+        const textTexture = new THREE.CanvasTexture(textCanvas);
+        this.textElement = new THREE.Mesh(
+          new THREE.PlaneGeometry(0.4, 0.2),
+          new THREE.MeshBasicMaterial({
+            map: textTexture,
+            transparent: true,
+            side: THREE.DoubleSide
+          })
+        );
+        
+        // Repositioned text element - moved down slightly as requested
+        this.textElement.position.set(0.08, 0.02, 0.001);
+        
+        this.textElement.userData.updateText = (text) => {
+          this.drawText(textCtx, text, textCanvas.width, textCanvas.height);
+          textTexture.needsUpdate = true;
+        };
+        
+        panel.add(this.textElement);
+      }
+      
+      drawText(ctx, text, width, height) {
+        // Clear canvas
+        ctx.clearRect(0, 0, width, height);
+        
+        // Set text style
+        ctx.font = '24px sans-serif';
+        ctx.fillStyle = 'white';
+        ctx.textBaseline = 'top';
+        
+        // Word wrap - improved
+        const words = text.split(' ');
+        const maxWidth = width - 20;
+        let line = '';
+        let lineY = 30; // Increased from 20 to move text down slightly
+        const lineHeight = 32;
+        
+        for (let i = 0; i < words.length; i++) {
+          const testLine = line + words[i] + ' ';
+          const metrics = ctx.measureText(testLine);
+          
+          if (metrics.width > maxWidth && i > 0) {
+            ctx.fillText(line, 10, lineY);
+            line = words[i] + ' ';
+            lineY += lineHeight;
+          } else {
+            line = testLine;
+          }
+        }
+        
+        ctx.fillText(line, 10, lineY);
+      }
+      
+      createNextButton(panel, panelWidth, panelHeight) {
+        // Simplified button design - reduced flickering by using a simpler approach
+        const buttonCanvas = document.createElement('canvas');
+        buttonCanvas.width = 128;
+        buttonCanvas.height = 128;
+        const buttonCtx = buttonCanvas.getContext('2d');
+        
+        // Draw initial button
+        this.drawSimpleButton(buttonCtx, false, buttonCanvas.width, buttonCanvas.height);
+        
+        const buttonTexture = new THREE.CanvasTexture(buttonCanvas);
+        const buttonMaterial = new THREE.MeshBasicMaterial({
+          map: buttonTexture,
+          transparent: true,
+          side: THREE.DoubleSide,
+          depthTest: false  // Prevents z-fighting/flickering
+        });
+        
+        this.nextButton = new THREE.Mesh(
+          new THREE.PlaneGeometry(0.05, 0.05),
+          buttonMaterial
+        );
+        
+        // Position at bottom right of panel
+        this.nextButton.position.set((panelWidth/2) - 0.05, -(panelHeight/2) + 0.05, 0.002); // Small z-offset to prevent flicker
+        
+        // Interactive behavior
+        this.nextButton.userData.onClick = () => {
+          this.showNextDialog();
+          
+          // Visual feedback
+          this.drawSimpleButton(buttonCtx, true, buttonCanvas.width, buttonCanvas.height);
+          buttonTexture.needsUpdate = true;
+          
+          setTimeout(() => {
+            this.drawSimpleButton(buttonCtx, false, buttonCanvas.width, buttonCanvas.height);
+            buttonTexture.needsUpdate = true;
+          }, 200);
+        };
+        
+        panel.add(this.nextButton);
+      }
+      
+      // Simplified button design to reduce flickering
+      drawSimpleButton(ctx, hover, width, height) {
+        // Clear canvas
+        ctx.clearRect(0, 0, width, height);
+        
+        // Draw simple filled circle with no gradients
+        ctx.beginPath();
+        ctx.arc(width/2, height/2, width/2.6, 0, 2 * Math.PI);
+        ctx.fillStyle = hover ? '#5993FF' : '#4876FF';
+        ctx.fill();
+        
+        // Draw simple arrow
+        ctx.beginPath();
+        ctx.moveTo(width*0.35, height*0.35);
+        ctx.lineTo(width*0.65, height*0.5);
+        ctx.lineTo(width*0.35, height*0.65);
+        ctx.closePath();
+        ctx.fillStyle = 'white';
+        ctx.fill();
+      }
+      
+      startDialogSequence() {
+        this.isActive = true;
+        this.currentDialogIndex = 0;
+        this.dialogPanel.visible = true;
+        this.showCurrentDialog();
+      }
+      
+      showCurrentDialog() {
+        if (this.currentDialogIndex >= this.dialogSequence.length) {
+          this.endDialogSequence();
+          return;
+        }
+        
+        const dialog = this.dialogSequence[this.currentDialogIndex];
+        
+        // Update portrait based on speaker
+        if (dialog.speaker === "Hero") {
+          // Try to use video material if available
+          if (this.videoMaterials.hero && this.videoMaterials.hero.material) {
+            this.portraitMesh.material = this.videoMaterials.hero.material;
+            // Force video to play
+            this.videoMaterials.hero.video.play().catch(e => console.warn('Hero video play error:', e));
+          } else {
+            this.portraitMesh.material.map = this.heroTexture;
+          }
+        } else {
+          // Try to use video material if available
+          if (this.videoMaterials.enemy && this.videoMaterials.enemy.material) {
+            this.portraitMesh.material = this.videoMaterials.enemy.material;
+            // Force video to play
+            this.videoMaterials.enemy.video.play().catch(e => console.warn('Enemy video play error:', e));
+          } else {
+            this.portraitMesh.material.map = this.enemyTexture;
+          }
+        }
+        
+        this.portraitMesh.material.needsUpdate = true;
+        
+        // Update name and text
+        this.nameElement.userData.updateName(dialog.speaker, dialog.color);
+        this.textElement.userData.updateText(dialog.message);
+      }
+      
+      showNextDialog() {
+        this.currentDialogIndex++;
+        if (this.currentDialogIndex >= this.dialogSequence.length) {
+          this.endDialogSequence();
+          return;
+        }
+        this.showCurrentDialog();
+      }
+      
+      endDialogSequence() {
+        this.isActive = false;
+        this.dialogPanel.visible = false;
+        updateStatus("Dialog complete! Starting over in 3 seconds...");
+        
+        // Restart after delay
+        setTimeout(() => this.startDialogSequence(), 3000);
+      }
+      
+      update(camera) {
+        if (!this.isActive || !this.dialogGroup || !camera) return;
+        
+        // Position dialog in front of camera
+        const cameraDirection = new THREE.Vector3(0, 0, -1);
+        cameraDirection.applyQuaternion(camera.quaternion);
+        cameraDirection.multiplyScalar(0.7); // Distance from camera
+        
+        this.dialogGroup.position.copy(camera.position).add(cameraDirection);
+        this.dialogGroup.lookAt(camera.position);
+        
+        // Adjust vertical position - slightly below eye level
+        this.dialogGroup.position.y = camera.position.y - 0.1;
+      }
+      
+      getInteractiveObjects() {
+        return [this.nextButton];
+      }
+    }
+    
+    // Initialize everything
+    document.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>
